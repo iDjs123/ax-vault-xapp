@@ -1,0 +1,155 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ─── PLATFORM ─────────────────────────────────────────────────────────────────
+// Minimal — needed by the deposit and withdrawal endpoints
+
+model Platform {
+  id             String  @id @default(cuid())
+  name           String
+  slug           String  @unique
+  destinationTag Int?    @unique
+  isActive       Boolean @default(true)
+
+  users    User[]
+  withdraws WithdrawRequest[]
+}
+
+// ─── USER ─────────────────────────────────────────────────────────────────────
+
+model User {
+  id         String   @id @default(cuid())
+  wallet     String?
+  platformId String
+  email      String?
+  createdAt  DateTime @default(now())
+  role       String   @default("user")
+
+  platform  Platform          @relation(fields: [platformId], references: [id])
+  withdraws WithdrawRequest[]
+
+  @@unique([wallet, platformId])
+}
+
+// ─── WITHDRAW REQUEST ─────────────────────────────────────────────────────────
+
+model WithdrawRequest {
+  id                 String    @id @default(cuid())
+  userId             String
+  asset              String
+  amount             Float
+  status             String    @default("pending")
+  network            String    @default("xrp")
+  destinationAddress String?
+  txHash             String?
+  notifyEmail        String?
+  rejectionReason    String?
+  approvedAt         DateTime?
+  completedAt        DateTime?
+  rejectedAt         DateTime?
+  createdAt          DateTime  @default(now())
+
+  user     User     @relation(fields: [userId], references: [id])
+  platform Platform? @relation(fields: [platformId], references: [id])
+  platformId String?
+}
+
+// ─── XAMAN / XAPP MODELS ──────────────────────────────────────────────────────
+
+model XamanWallet {
+  id        String   @id @default(cuid())
+  wallet    String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  deposits    XamanDeposit[]
+  loans       XamanLoan[]
+  withdrawals XamanWithdrawal[]
+}
+
+model XamanDeposit {
+  id         String    @id @default(cuid())
+  wallet     String
+  asset      String
+  amount     Float
+  lockMonths Int       @default(0)
+  apy        Float     @default(3.0)
+  startDate  DateTime  @default(now())
+  endDate    DateTime?
+  status     String    @default("active")
+  txid       String?   @unique
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  xamanWallet XamanWallet     @relation(fields: [wallet], references: [wallet])
+  interest    XamanInterest[]
+
+  @@index([wallet])
+}
+
+model XamanInterest {
+  id        String   @id @default(cuid())
+  depositId String
+  amount    Float
+  asset     String
+  paidAt    DateTime @default(now())
+
+  deposit XamanDeposit @relation(fields: [depositId], references: [id])
+}
+
+model XamanWithdrawal {
+  id          String    @id @default(cuid())
+  wallet      String
+  asset       String
+  amount      Float
+  interest    Float     @default(0)
+  total       Float
+  depositId   String?
+  status      String    @default("pending")
+  requestedAt DateTime  @default(now())
+  completedAt DateTime?
+  txid        String?
+
+  xamanWallet XamanWallet @relation(fields: [wallet], references: [wallet])
+
+  @@index([wallet])
+}
+
+model XamanLoan {
+  id              String   @id @default(cuid())
+  wallet          String
+  collateralAsset String   @default("RLUSD")
+  collateral      Float
+  loanAsset       String   @default("RLUSD")
+  loanAmount      Float
+  ltv             Float    @default(75)
+  interestRate    Float    @default(8.0)
+  monthlyPayment  Float
+  nextPaymentDate DateTime
+  status          String   @default("active")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  xamanWallet XamanWallet        @relation(fields: [wallet], references: [wallet])
+  payments    XamanLoanPayment[]
+
+  @@index([wallet])
+}
+
+model XamanLoanPayment {
+  id     String   @id @default(cuid())
+  loanId String
+  amount Float
+  asset  String
+  paidAt DateTime @default(now())
+  txid   String?
+
+  loan XamanLoan @relation(fields: [loanId], references: [id])
+}
