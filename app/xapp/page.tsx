@@ -54,24 +54,55 @@ type Loan = {
 }
 
 const XAMAN_PAYLOAD_TIMEOUT = 5 * 60
-const APY = 3
+
+// APY real usado internamente para calcular intereses (independiente del APY mostrado)
+const REAL_APY: Record<"XRP" | "RLUSD", number> = { XRP: 3, RLUSD: 6 }
+
+// APY mostrado al usuario por asset y período (marketing / tiers)
+const DISPLAYED_APY: Record<"XRP" | "RLUSD", Record<number, number>> = {
+  XRP:   { 0: 1.0, 1: 1.5, 3: 2.0, 6: 2.5,  12: 3.0 },
+  RLUSD: { 0: 3.0, 1: 3.5, 3: 4.0, 6: 5.0,  12: 6.0 },
+}
+
+// Etiqueta APY mostrada en UI (12 meses muestra rango atractivo)
+const APY_LABEL: Record<"XRP" | "RLUSD", Record<number, string>> = {
+  XRP:   { 0: "1%", 1: "1.5%", 3: "2%", 6: "2.5%", 12: "3-4.5%" },
+  RLUSD: { 0: "3%", 1: "3.5%", 3: "4%", 6: "5%",   12: "6-7%" },
+}
+
+// Rango APY mostrado en el selector de asset
+const ASSET_APY_RANGE: Record<"XRP" | "RLUSD", string> = {
+  XRP:   "1% - 4.5% APY",
+  RLUSD: "3% - 7% APY",
+}
+
+const FROZEN_BALANCES_KEY = "xapp_frozen_balances"
+const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000
+
+function getDisplayedApy(asset: "XRP" | "RLUSD", lockMonths: number): number {
+  return DISPLAYED_APY[asset][lockMonths] ?? DISPLAYED_APY[asset][0]
+}
+
+function getApyLabel(asset: "XRP" | "RLUSD", lockMonths: number): string {
+  return APY_LABEL[asset][lockMonths] ?? APY_LABEL[asset][0]
+}
 
 const LOCK_OPTIONS = [
-  { months: 0, label: "Flexible" },
-  { months: 1, label: "1 mes" },
-  { months: 3, label: "3 meses" },
-  { months: 6, label: "6 meses" },
-  { months: 12, label: "12 meses" },
+  { months: 0,  label: "Flexible" },
+  { months: 1,  label: "1 month"  },
+  { months: 3,  label: "3 months" },
+  { months: 6,  label: "6 months" },
+  { months: 12, label: "12 months"},
 ]
 
 function calcInterest(amount: number, apy: number, startDate: string): number {
   const days = (Date.now() - new Date(startDate).getTime()) / (1000 * 60 * 60 * 24)
-  return amount * (apy / 100) * (days / 365)
+  return amount * (apy / 100) * (days / 365.25)
 }
 
 function calcLoanInterest(amount: number, rate: number, startDate: string): number {
   const days = (Date.now() - new Date(startDate).getTime()) / (1000 * 60 * 60 * 24)
-  return amount * (rate / 100) * (days / 365)
+  return amount * (rate / 100) * (days / 365.25)
 }
 
 function calcEndDate(startDate: string, months: number): string | null {
@@ -94,7 +125,7 @@ function daysLeft(endDate: string | null): number {
 }
 
 function maxWithdrawable(position: Position): number {
-  return position.amount + calcInterest(position.amount, position.apy, position.startDate)
+  return position.amount + calcInterest(position.amount, REAL_APY[position.asset], position.startDate)
 }
 
 function hasRealFunds(position: Position): boolean {
@@ -162,6 +193,9 @@ export default function XApp() {
   const [loading, setLoading] = useState(false)
   const [toast, setToast] = useState<Toast | null>(null)
   const [positions, setPositions] = useState<Position[]>([])
+  const [serverWithdrawals, setServerWithdrawals] = useState<TxRecord[]>([])
+  const [refreshPositionsTick, setRefreshPositionsTick] = useState(0)
+  const prevCompletedIdsRef = useRef<Set<string>>(new Set())
   const [txHistory, setTxHistory] = useState<TxRecord[]>([])
   const [withdrawalRequests, setWithdrawalRequests] = useState<WithdrawalRequest[]>([])
   const [loans, setLoans] = useState<Loan[]>([])
@@ -176,6 +210,39 @@ export default function XApp() {
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const [walletBalance, setWalletBalance] = useState<{ XRP: number; RLUSD: number }>({ XRP: 0, RLUSD: 0 })
   const [balanceLoading, setBalanceLoading] = useState(true)
+  const [frozenBalances, setFrozenBalances] = useState<Record<string, { interest: number; shownAt: number }>>({})
+
+  // ── Persistent storage: Xumm userstore (xApp) + localStorage fallback ───
+  // Escribe en userstore si está disponible; cae a localStorage si no.
+  async function storeSet(key: string, value: string): Promise<void> {
+    try {
+      if ((xummRef.current as any)?.userstore) {
+        await (xummRef.current as any).userstore.set(key, value)
+        return
+      }
+    } catch {}
+    try { localStorage.setItem(key, value) } catch {}
+  }
+
+  async function storeGet(key: string): Promise<string | null> {
+    try {
+      if ((xummRef.current as any)?.userstore) {
+        const res = await (xummRef.current as any).userstore.get(key)
+        const data = res?.data
+        if (data != null && data !== "") return String(data)
+      }
+    } catch {}
+    try { return localStorage.getItem(key) } catch { return null }
+  }
+
+  async function storeRemove(key: string): Promise<void> {
+    try {
+      if ((xummRef.current as any)?.userstore) {
+        await (xummRef.current as any).userstore.set(key, "")
+      }
+    } catch {}
+    try { localStorage.removeItem(key) } catch {}
+  }
 
   // ── Inicializar Xumm SDK + auto-connect ─────────────────────────────────
   useEffect(() => {
@@ -197,6 +264,7 @@ export default function XApp() {
           setIsDark(String(style).toUpperCase() === "DARK")
         } catch {}
 
+
         if (xumm.runtime?.xapp) {
           setIsXapp(true)
           // Intentar obtener cuenta directamente
@@ -209,7 +277,7 @@ export default function XApp() {
             } catch {}
           }
           if (account) {
-            localStorage.setItem("xaman_wallet", account)
+            storeSet("xaman_wallet", account).catch(() => {})
             setWallet(account)
             setXummReady(true)
             return
@@ -218,19 +286,19 @@ export default function XApp() {
           xumm.user.on("retrieved", async () => {
             const acc = await xumm.user.account
             if (acc) {
-              localStorage.setItem("xaman_wallet", acc)
+              storeSet("xaman_wallet", acc).catch(() => {})
               setWallet(acc)
             }
             setXummReady(true)
           })
         } else {
           // Browser normal: recuperar sesión guardada
-          const saved = localStorage.getItem("xaman_wallet")
+          const saved = await storeGet("xaman_wallet")
           if (saved) setWallet(saved)
           setXummReady(true)
         }
       } catch {
-        const saved = localStorage.getItem("xaman_wallet")
+        const saved = await storeGet("xaman_wallet")
         if (saved) setWallet(saved)
         setXummReady(true)
       }
@@ -257,14 +325,17 @@ export default function XApp() {
     return () => { root.removeAttribute("data-xapp-theme") }
   }, [isDark])
 
-  // ── Cargar estado persistido de localStorage ─────────────────────────────
+  // ── Cargar estado persistido ─────────────────────────────────────────────
   useEffect(() => {
-    const p = localStorage.getItem("xaman_positions")
-    if (p) try { setPositions(JSON.parse(p)) } catch {}
-    const h = localStorage.getItem("xaman_history")
-    if (h) try { setTxHistory(JSON.parse(h)) } catch {}
-    const wr = localStorage.getItem("xaman_withdrawal_requests")
-    if (wr) try { setWithdrawalRequests(JSON.parse(wr)) } catch {}
+    async function loadStored() {
+      const p = await storeGet("xaman_positions")
+      if (p) try { setPositions(JSON.parse(p)) } catch {}
+      const h = await storeGet("xaman_history")
+      if (h) try { setTxHistory(JSON.parse(h)) } catch {}
+      const wr = await storeGet("xaman_withdrawal_requests")
+      if (wr) try { setWithdrawalRequests(JSON.parse(wr)) } catch {}
+    }
+    loadStored()
   }, [])
 
   // ── Balance XRPL on-chain (account_info + account_lines) ────────────────
@@ -287,6 +358,102 @@ export default function XApp() {
     return () => clearInterval(iv)
   }, [wallet])
 
+  // ── Balance congelado: actualiza interés visible cada 7 días ─────────────
+  useEffect(() => {
+    if (positions.length === 0) return
+    async function updateFrozen() {
+      const now = Date.now()
+      let stored: Record<string, { interest: number; shownAt: number }> = {}
+      try { stored = JSON.parse((await storeGet(FROZEN_BALANCES_KEY)) ?? "{}") } catch {}
+      const updated = { ...stored }
+      let changed = false
+      for (const pos of positions) {
+        if (pos.status !== "active") continue
+        const entry = updated[pos.id]
+        if (!entry || now - entry.shownAt >= SEVEN_DAYS_MS) {
+          updated[pos.id] = {
+            interest: calcInterest(pos.amount, REAL_APY[pos.asset], pos.startDate),
+            shownAt: now,
+          }
+          changed = true
+        }
+      }
+      if (changed) {
+        setFrozenBalances(updated)
+        storeSet(FROZEN_BALANCES_KEY, JSON.stringify(updated)).catch(() => {})
+      } else {
+        setFrozenBalances(stored)
+      }
+    }
+    updateFrozen()
+  }, [positions])
+
+  // ── Polling de retiros completados cada 30s — refresca posiciones ────────
+  useEffect(() => {
+    if (!wallet) return
+
+    async function pollWithdraws() {
+      try {
+        const res = await fetch("/api/xaman/withdraw/history", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ wallet }),
+        })
+        if (!res.ok) return
+        const data = await res.json()
+        if (!data.withdraws?.length) return
+
+        const completed: TxRecord[] = []
+        for (const w of data.withdraws) {
+          if (w.status === "completed") {
+            completed.push({
+              id: w.id,
+              type: "withdrawal",
+              asset: w.asset,
+              amount: Number(w.amount),
+              txid: w.txHash ?? "",
+              ts: new Date(w.completedAt ?? w.createdAt).toLocaleString(),
+              status: "confirmed",
+            })
+          }
+        }
+
+        setServerWithdrawals(completed)
+
+        // Si hay nuevos retiros completados → forzar recarga inmediata de posiciones
+        const hasNewCompletions = completed.some((c) => !prevCompletedIdsRef.current.has(c.id))
+        prevCompletedIdsRef.current = new Set(completed.map((c) => c.id))
+        if (hasNewCompletions) {
+          setRefreshPositionsTick((t) => t + 1)
+
+          // Sincronizar estado "confirmed" en withdrawalRequests y txHistory
+          const completedMap = new Map(completed.map((c) => [c.id, c]))
+          setWithdrawalRequests((prev) => {
+            const updated = prev.map((req) =>
+              completedMap.has(req.id) ? { ...req, status: "confirmed" as const } : req
+            )
+            storeSet("xaman_withdrawal_requests", JSON.stringify(updated)).catch(() => {})
+            return updated
+          })
+          setTxHistory((prev) => {
+            const updated = prev.map((tx) => {
+              if (tx.type !== "withdrawal") return tx
+              const done = completedMap.get(tx.id)
+              if (!done) return tx
+              return { ...tx, status: "confirmed" as const, txid: done.txid || tx.txid }
+            })
+            storeSet("xaman_history", JSON.stringify(updated)).catch(() => {})
+            return updated
+          })
+        }
+      } catch {}
+    }
+
+    pollWithdraws()
+    const iv = setInterval(pollWithdraws, 30000)
+    return () => clearInterval(iv)
+  }, [wallet])
+
   // ── Cargar datos de DB cuando wallet está lista ──────────────────────────
   useEffect(() => {
     if (!wallet) return
@@ -294,36 +461,59 @@ export default function XApp() {
     async function loadFromDB() {
       try {
         const res = await fetch(`/api/xaman/positions?wallet=${wallet}`)
+        if (!res.ok) return
         const data = await res.json()
-        if (data.deposits && data.deposits.length > 0) {
-          setPositions(
-            data.deposits.map((d: any) => ({
-              id: d.id,
-              asset: d.asset,
-              amount: Number(d.amount),
-              lockMonths: d.lockMonths,
-              apy: Number(d.apy),
-              startDate: d.startDate,
-              endDate: d.endDate,
-              status: d.status,
-              txid: d.txid ?? "",
-            }))
-          )
+
+        // Fix 3: SIEMPRE actualizar positions — incluso si es [] (retiros completados)
+        setPositions(
+          (data.deposits ?? []).map((d: any) => ({
+            id: d.id,
+            asset: d.asset,
+            amount: Number(d.amount),
+            lockMonths: d.lockMonths,
+            apy: Number(d.apy),
+            startDate: d.startDate,
+            endDate: d.endDate,
+            status: d.status,
+            txid: d.txid ?? "",
+          }))
+        )
+
+        // Historial de depósitos desde DB (todos los estados, incluyendo withdrawn)
+        if (data.depositHistory) {
+          const serverDepositEntries: TxRecord[] = data.depositHistory.map((d: any) => ({
+            id: d.id,
+            type: "deposit" as const,
+            asset: d.asset,
+            amount: Number(d.amount),
+            txid: d.txid ?? "",
+            ts: new Date(d.createdAt).toLocaleString(),
+            status: "confirmed" as const,
+          }))
+          setTxHistory((prev) => {
+            // Reemplazar entradas de depósito con las del servidor; mantener retiros locales
+            const prevWithdrawals = prev.filter((tx) => tx.type !== "deposit")
+            return [...serverDepositEntries, ...prevWithdrawals]
+          })
         }
-        if (data.withdrawals && data.withdrawals.length > 0) {
-          setTxHistory(
-            data.withdrawals.map((w: any) => ({
-              id: w.id,
-              type: "withdrawal",
-              asset: w.asset,
-              amount: Number(w.total),
-              txid: w.txid ?? "",
-              ts: new Date(w.requestedAt).toLocaleString(),
-              status: w.txid ? "confirmed" : "pending",
-            }))
-          )
+
+        // Historial de retiros desde DB (fusionar con depósitos)
+        if (data.withdrawals) {
+          const serverWithdrawEntries: TxRecord[] = data.withdrawals.map((w: any) => ({
+            id: w.id,
+            type: "withdrawal" as const,
+            asset: w.asset,
+            amount: Number(w.total ?? w.amount),
+            txid: w.txid ?? "",
+            ts: new Date(w.requestedAt ?? w.createdAt).toLocaleString(),
+            status: (w.status === "completed" ? "confirmed" : "pending") as "confirmed" | "pending",
+          }))
+          setTxHistory((prev) => {
+            const prevDeposits = prev.filter((tx) => tx.type !== "withdrawal")
+            return [...prevDeposits, ...serverWithdrawEntries]
+          })
         }
-        if (data.loans && data.loans.length > 0) {
+        if (data.loans) {
           setLoans(
             data.loans.map((l: any) => {
               const daysActive = Math.floor(
@@ -358,19 +548,19 @@ export default function XApp() {
     loadFromDB()
     const iv = setInterval(loadFromDB, 10000)
     return () => clearInterval(iv)
-  }, [wallet])
+  }, [wallet, refreshPositionsTick])
 
   // ── Helpers ───────────────────────────────────────────────────────────────
   function save(newPositions: Position[], newHistory: TxRecord[]) {
     setPositions(newPositions)
     setTxHistory(newHistory)
-    localStorage.setItem("xaman_positions", JSON.stringify(newPositions))
-    localStorage.setItem("xaman_history", JSON.stringify(newHistory))
+    storeSet("xaman_positions", JSON.stringify(newPositions)).catch(() => {})
+    storeSet("xaman_history", JSON.stringify(newHistory)).catch(() => {})
   }
 
   function saveWithdrawalRequests(requests: WithdrawalRequest[]) {
     setWithdrawalRequests(requests)
-    localStorage.setItem("xaman_withdrawal_requests", JSON.stringify(requests))
+    storeSet("xaman_withdrawal_requests", JSON.stringify(requests)).catch(() => {})
   }
 
   function showToast(type: "success" | "error", msg: string) {
@@ -398,7 +588,7 @@ export default function XApp() {
         if (s === null || s <= 1) {
           clearInterval(timerRef.current!)
           closeModal()
-          showToast("error", "QR expirado — intenta de nuevo")
+          showToast("error", "QR expired — try again")
           return null
         }
         return s - 1
@@ -425,7 +615,7 @@ export default function XApp() {
       r.id === id && r.status === "pending" ? { ...r, status: "cancelled" as const } : r
     )
     saveWithdrawalRequests(updated)
-    showToast("success", "Retiro cancelado")
+    showToast("success", "Withdrawal cancelled")
     // Sincronizar con DB (no bloqueante)
     fetch("/api/xaman/withdraw/cancel", {
       method: "POST",
@@ -435,8 +625,19 @@ export default function XApp() {
   }
 
   function disconnect() {
-    localStorage.removeItem("xaman_wallet")
+    storeRemove("xaman_wallet").catch(() => {})
     setWallet(null)
+  }
+
+  function getFrozenInterest(pos: Position): number {
+    return frozenBalances[pos.id]?.interest ?? calcInterest(pos.amount, REAL_APY[pos.asset], pos.startDate)
+  }
+
+  function getDaysUntilUpdate(posId: string): number {
+    const entry = frozenBalances[posId]
+    if (!entry) return 0
+    const remaining = entry.shownAt + SEVEN_DAYS_MS - Date.now()
+    return Math.max(0, Math.ceil(remaining / (1000 * 60 * 60 * 24)))
   }
 
   // ── Abrir links externos: dentro de xApp usa openBrowser(), fuera usa window.open ──
@@ -460,11 +661,11 @@ export default function XApp() {
         await xumm.authorize()
         const account = await xumm.user.account
         if (account) {
-          localStorage.setItem("xaman_wallet", account)
+          storeSet("xaman_wallet", account).catch(() => {})
           setWallet(account)
-          showToast("success", "Wallet conectada ✓")
+          showToast("success", "Wallet connected ✓")
         } else {
-          showToast("error", "No se pudo obtener la cuenta")
+          showToast("error", "Could not get account")
         }
       } else {
         // Fuera de Xaman: QR flow via /api/xaman/connect
@@ -478,18 +679,18 @@ export default function XApp() {
         startCountdown()
       }
     } catch (e: any) {
-      showToast("error", e?.message ?? "Error al conectar")
+      showToast("error", e?.message ?? "Error connecting")
     } finally {
       setLoading(false)
     }
   }
 
   async function deposit() {
-    if (!wallet) return showToast("error", "Conecta tu wallet primero")
+    if (!wallet) return showToast("error", "Connect your wallet first")
     const amt = Number(amount)
-    if (!amount || amt <= 0) return showToast("error", "Ingresa un monto válido")
+    if (!amount || amt <= 0) return showToast("error", "Enter a valid amount")
     if (!balanceLoading && walletBalance[asset] > 0 && amt > walletBalance[asset] + 1e-9)
-      return showToast("error", `Saldo insuficiente — disponible: ${walletBalance[asset].toFixed(4)} ${asset}`)
+      return showToast("error", `Insufficient balance — available: ${walletBalance[asset].toFixed(4)} ${asset}`)
     setLoading(true)
     try {
       const res = await fetch("/api/xaman/deposit", {
@@ -502,20 +703,20 @@ export default function XApp() {
       setDepositUuid(data.uuid)
       openSignRequest(data.uuid, data.qr, data.deeplink)
     } catch {
-      showToast("error", "Error al crear depósito")
+      showToast("error", "Error creating deposit")
     } finally {
       setLoading(false)
     }
   }
 
   async function requestLoan() {
-    if (!wallet) return showToast("error", "Conecta tu wallet primero")
+    if (!wallet) return showToast("error", "Connect your wallet first")
     if (!loanCollateral || Number(loanCollateral) <= 0)
-      return showToast("error", "Ingresa el monto de colateral")
+      return showToast("error", "Enter collateral amount")
     const termsCheckbox = document.getElementById("loan-terms-xapp") as HTMLInputElement
-    if (!termsCheckbox?.checked) return showToast("error", "Acepta los términos del préstamo")
+    if (!termsCheckbox?.checked) return showToast("error", "Accept the loan terms")
     if (Number(loanCollateral) > rlusdVaultBalance + 1e-9)
-      return showToast("error", `Colateral supera tu RLUSD en vault (${rlusdVaultBalance.toFixed(4)})`)
+      return showToast("error", `Collateral exceeds your RLUSD in vault (${rlusdVaultBalance.toFixed(4)})`)
 
     const collateral = Number(loanCollateral)
     const loanAmount = collateral * 0.75
@@ -538,14 +739,14 @@ export default function XApp() {
       setDepositUuid(data.uuid)
       openSignRequest(data.uuid, data.qr, data.deeplink)
     } catch {
-      showToast("error", "Error al crear solicitud de préstamo")
+      showToast("error", "Error creating loan request")
     } finally {
       setLoading(false)
     }
   }
 
   async function repayLoan(loan: Loan) {
-    if (!wallet) return showToast("error", "Conecta tu wallet primero")
+    if (!wallet) return showToast("error", "Connect your wallet first")
     setLoading(true)
     try {
       const res = await fetch("/api/xaman/deposit", {
@@ -565,7 +766,7 @@ export default function XApp() {
       setDepositUuid(data.uuid)
       openSignRequest(data.uuid, data.qr, data.deeplink)
     } catch {
-      showToast("error", "Error al crear pago")
+      showToast("error", "Error creating payment")
     } finally {
       setLoading(false)
     }
@@ -577,10 +778,10 @@ export default function XApp() {
     positionId: string,
     maxAllowed: number
   ) {
-    if (!wallet) return showToast("error", "Conecta tu wallet primero")
-    if (withdrawAmt <= 0) return showToast("error", "Ingresa un monto válido")
+    if (!wallet) return showToast("error", "Connect your wallet first")
+    if (withdrawAmt <= 0) return showToast("error", "Enter a valid amount")
     if (withdrawAmt > maxAllowed + 1e-9)
-      return showToast("error", "No puedes retirar más del depositado + interés")
+      return showToast("error", "Cannot withdraw more than deposited + interest")
 
     setLoading(true)
     try {
@@ -612,33 +813,33 @@ export default function XApp() {
         txid: "", ts, status: "pending", positionId,
       }
       save(positions, [newTx, ...txHistory])
-      showToast("success", "Solicitud enviada — recibirás tu retiro en 24-48h")
+      showToast("success", "Request sent — you'll receive your withdrawal in 24-48h")
     } catch (e: any) {
-      showToast("error", e?.message ?? "Error al solicitar retiro")
+      showToast("error", e?.message ?? "Error requesting withdrawal")
     } finally {
       setLoading(false)
     }
   }
 
   async function withdraw(position: Position) {
-    if (!hasRealFunds(position)) return showToast("error", "Sin fondos en esta posición")
+    if (!hasRealFunds(position)) return showToast("error", "No funds in this position")
     if (!canWithdraw(position))
-      return showToast("error", `Bloqueado — ${daysLeft(position.endDate)} días restantes`)
+      return showToast("error", `Locked — ${daysLeft(position.endDate)} days`)
     if (hasPendingWithdrawal(position.id, withdrawalRequests))
-      return showToast("error", "Ya hay un retiro pendiente para esta posición")
+      return showToast("error", "There is already a pending withdrawal for this position")
     if (hasPendingWithdrawalForAsset(position.asset, withdrawalRequests))
-      return showToast("error", "Ya hay un retiro pendiente para este activo")
+      return showToast("error", "There is already a pending withdrawal for this asset")
     const total = maxWithdrawable(position)
-    if (total <= 0) return showToast("error", "Sin fondos disponibles")
+    if (total <= 0) return showToast("error", "No funds available")
     await submitWithdrawal(position.asset, total, position.id, total)
   }
 
   async function requestWithdrawal() {
-    if (!wallet) return showToast("error", "Conecta tu wallet primero")
+    if (!wallet) return showToast("error", "Connect your wallet first")
     const amt = Number(withdrawAmount)
-    if (!withdrawAmount || amt <= 0) return showToast("error", "Ingresa un monto válido")
+    if (!withdrawAmount || amt <= 0) return showToast("error", "Enter a valid amount")
     if (hasPendingWithdrawalForAsset(withdrawAsset, withdrawalRequests))
-      return showToast("error", "Ya hay un retiro pendiente para este activo")
+      return showToast("error", "There is already a pending withdrawal for this asset")
 
     const available = getAvailableBalance(withdrawAsset, activePositions)
     const locked = getLockedPositionsForAsset(withdrawAsset, activePositions)
@@ -646,16 +847,16 @@ export default function XApp() {
     if (amt > available + 1e-9) {
       if (available === 0 && locked.length > 0) {
         const minDays = Math.min(...locked.map((p) => daysLeft(p.endDate)))
-        return showToast("error", `Posición bloqueada — ${minDays} días restantes`)
+        return showToast("error", `Position locked — ${minDays} days remaining`)
       }
-      return showToast("error", "Monto supera el saldo disponible")
+      return showToast("error", "Amount exceeds available balance")
     }
 
     const sourcePosition = activePositions.find(
       (p) => p.asset === withdrawAsset && hasRealFunds(p) && canWithdraw(p)
     )
     if (!sourcePosition)
-      return showToast("error", "Sin posiciones desbloqueadas para este activo")
+      return showToast("error", "No unlocked positions for this asset")
 
     await submitWithdrawal(withdrawAsset, amt, sourcePosition.id, available)
     setWithdrawAmount("")
@@ -673,14 +874,14 @@ export default function XApp() {
         })
         const data = await res.json()
         if (data.signed && data.account) {
-          localStorage.setItem("xaman_wallet", data.account)
+          storeSet("xaman_wallet", data.account).catch(() => {})
           setWallet(data.account)
           closeModal()
-          showToast("success", "Wallet conectada ✓")
+          showToast("success", "Wallet connected ✓")
           clearInterval(iv)
         } else if (data.cancelled || data.expired) {
           closeModal()
-          showToast("error", "Conexión cancelada")
+          showToast("error", "Connection cancelled")
           clearInterval(iv)
         }
       } catch {}
@@ -705,7 +906,7 @@ export default function XApp() {
             asset,
             amount: Number(amount),
             lockMonths,
-            apy: APY,
+            apy: getDisplayedApy(asset, lockMonths),
             startDate: now,
             endDate: calcEndDate(now, lockMonths),
             status: "active",
@@ -729,19 +930,20 @@ export default function XApp() {
               asset,
               amount,
               lockMonths,
-              apy: 3.0,
+              apy: getDisplayedApy(asset, lockMonths),
               txid: data.txid,
               endDate: calcEndDate(new Date().toISOString(), lockMonths),
             }),
           }).catch(() => {})
           setAmount("")
+          setDepositUuid(null)
           closeModal()
-          showToast("success", `Depósito confirmado ✓ — ${amount} ${asset}`)
+          showToast("success", `Deposit confirmed ✓ — ${amount} ${asset}`)
           setTab("positions")
           clearInterval(iv)
         } else if (data.cancelled || data.expired) {
           closeModal()
-          showToast("error", "Depósito cancelado")
+          showToast("error", "Deposit cancelled")
           clearInterval(iv)
         }
       } catch {}
@@ -772,12 +974,11 @@ export default function XApp() {
     [activePositions]
   )
   const totalInterest = useMemo(
-    () =>
-      activePositions.reduce(
-        (acc, p) => acc + calcInterest(Number(p.amount), Number(p.apy), p.startDate),
-        0
-      ),
-    [activePositions]
+    () => activePositions.reduce(
+      (acc, p) => acc + (frozenBalances[p.id]?.interest ?? calcInterest(Number(p.amount), REAL_APY[p.asset], p.startDate)),
+      0
+    ),
+    [activePositions, frozenBalances]
   )
   const totalLoaned = useMemo(
     () =>
@@ -797,7 +998,7 @@ export default function XApp() {
 
   const estReturn =
     amount && Number(amount) > 0
-      ? (Number(amount) * (APY / 100) * (lockMonths === 0 ? 1 : lockMonths / 12)).toFixed(4)
+      ? (Number(amount) * (REAL_APY[asset] / 100) * (lockMonths === 0 ? 1 : lockMonths / 12)).toFixed(4)
       : "0.00"
 
   // ── Loading inicial ───────────────────────────────────────────────────────
@@ -806,7 +1007,7 @@ export default function XApp() {
       <div className="flex min-h-screen items-center justify-center bg-white">
         <div className="text-center space-y-3">
           <div className="w-5 h-5 border-2 border-violet-400 border-t-transparent rounded-full animate-spin mx-auto" />
-          <p className="text-sm text-gray-400">Iniciando AX Vault…</p>
+          <p className="text-sm text-gray-400">{"Starting AX Vault…"}</p>
         </div>
       </div>
     )
@@ -826,13 +1027,13 @@ export default function XApp() {
         )}
 
         <h1 className="text-2xl font-bold text-gray-900 mb-1">AX Vault</h1>
-        <p className="text-base text-gray-500 mb-8">XRPL Earn &amp; Loans</p>
+        <p className="text-base text-gray-500 mb-8">{"XRPL Earn & Loans"}</p>
 
         <div className="w-full max-w-xs space-y-3 mb-8">
           {[
-            { icon: "💰", text: "Deposita XRP y RLUSD · 3% APY" },
-            { icon: "📈", text: "Posiciones flexibles o con lock" },
-            { icon: "💳", text: "Préstamos con colateral RLUSD · 75% LTV" },
+            { icon: "💰", text: "XRP up to 4.5% · RLUSD up to 7% APY" },
+            { icon: "📈", text: "Flexible or locked positions" },
+            { icon: "💳", text: "Loans with RLUSD collateral · 75% LTV" },
           ].map(({ icon, text }) => (
             <div
               key={text}
@@ -847,7 +1048,7 @@ export default function XApp() {
         {isXapp ? (
           <div className="text-center space-y-3">
             <div className="w-6 h-6 border-2 border-violet-400 border-t-transparent rounded-full animate-spin mx-auto" />
-            <p className="text-sm text-gray-400">Conectando con Xaman…</p>
+            <p className="text-sm text-gray-400">{"Connecting with Xaman…"}</p>
           </div>
         ) : (
           <button
@@ -855,7 +1056,7 @@ export default function XApp() {
             disabled={loading}
             className="w-full max-w-xs min-h-[52px] rounded-2xl font-bold text-base text-white bg-gradient-to-r from-blue-500 to-violet-600 active:opacity-80 disabled:opacity-40"
           >
-            {loading ? "Conectando…" : "Conectar con Xaman"}
+            {loading ? "Connecting…" : "Connect with Xaman"}
           </button>
         )}
       </div>
@@ -892,7 +1093,7 @@ export default function XApp() {
             onClick={disconnect}
             className="min-h-[36px] px-3 py-1.5 text-sm rounded-lg border border-red-200 text-red-600 active:bg-red-50"
           >
-            Salir
+            {"Exit"}
           </button>
         </div>
       </header>
@@ -901,10 +1102,10 @@ export default function XApp() {
       <div className="px-4 pt-4">
         <div className="grid grid-cols-2 gap-3">
           {[
-            { label: "Posiciones activas", value: String(activePositions.length) },
-            { label: "Total depositado", value: totalDeposited.toFixed(2) },
-            { label: "Interés ganado", value: `+${totalInterest.toFixed(4)}` },
-            { label: "Préstamos activos", value: totalLoaned.toFixed(2) },
+            { label: "Active positions", value: String(activePositions.length) },
+            { label: "Total deposited", value: totalDeposited.toFixed(2) },
+            { label: "Interest earned", value: `+${totalInterest.toFixed(4)}` },
+            { label: "Active loans", value: totalLoaned.toFixed(2) },
           ].map((s) => (
             <div
               key={s.label}
@@ -922,14 +1123,14 @@ export default function XApp() {
         <div className="flex gap-1 overflow-x-auto rounded-xl border border-gray-200 bg-white p-1 shadow-sm [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden">
           {(
             [
-              { key: "deposit", label: "💰 Depositar" },
+              { key: "deposit", label: "💰 Deposit" },
               {
                 key: "positions",
-                label: `📊 Posiciones${activePositions.length > 0 ? ` (${activePositions.length})` : ""}`,
+                label: `${"📊 Positions"}${activePositions.length > 0 ? ` (${activePositions.length})` : ""}`,
               },
-              { key: "withdraw", label: "⬆️ Retirar" },
-              { key: "loans", label: "💳 Préstamos" },
-              { key: "history", label: "📋 Historial" },
+              { key: "withdraw", label: "⬆️ Withdraw" },
+              { key: "loans", label: "💳 Loans" },
+              { key: "history", label: "📋 History" },
             ] as { key: Tab; label: string }[]
           ).map((t) => (
             <button
@@ -950,7 +1151,7 @@ export default function XApp() {
         {tab === "deposit" && (
           <div className="rounded-2xl bg-white border border-gray-200 shadow-sm p-5 space-y-5">
             <div>
-              <p className="text-xs text-gray-500 uppercase tracking-wider mb-2">Activo</p>
+              <p className="text-xs text-gray-500 uppercase tracking-wider mb-2">{"Asset"}</p>
               <div className="flex gap-3">
                 {(["XRP", "RLUSD"] as const).map((a) => (
                   <button
@@ -961,21 +1162,24 @@ export default function XApp() {
                         ? "bg-gradient-to-r from-blue-500/20 to-violet-600/20 border-blue-500/50 text-gray-900"
                         : "border-gray-200 text-gray-500"}`}
                   >
-                    <span className="flex items-center justify-center gap-2">
-                      {a === "XRP" ? (
-                        <img
-                          src="https://assets.coingecko.com/coins/images/44/small/xrp-symbol-white-128.png"
-                          alt="XRP"
-                          className="w-5 h-5 object-contain"
-                        />
-                      ) : (
-                        <img
-                          src="/icons/rlusd.svg"
-                          alt="RLUSD"
-                          className="w-5 h-5 object-contain"
-                        />
-                      )}
-                      {a}
+                    <span className="flex flex-col items-center justify-center gap-0.5">
+                      <span className="flex items-center gap-1.5">
+                        {a === "XRP" ? (
+                          <img
+                            src="https://assets.coingecko.com/coins/images/44/small/xrp-symbol-white-128.png"
+                            alt="XRP"
+                            className="w-5 h-5 object-contain"
+                          />
+                        ) : (
+                          <img
+                            src="/icons/rlusd.svg"
+                            alt="RLUSD"
+                            className="w-5 h-5 object-contain"
+                          />
+                        )}
+                        <span>{a}</span>
+                      </span>
+                      <span className="text-[10px] font-normal opacity-60">{ASSET_APY_RANGE[a]}</span>
                     </span>
                   </button>
                 ))}
@@ -984,7 +1188,7 @@ export default function XApp() {
 
             <div>
               <p className="text-xs text-gray-500 uppercase tracking-wider mb-2">
-                Período de lock · 3% APY
+                {"Period"} · <span className="text-violet-600 font-semibold normal-case">{getApyLabel(asset, lockMonths)} APY</span>
               </p>
               <div className="grid grid-cols-5 gap-1.5">
                 {LOCK_OPTIONS.map((opt) => (
@@ -1000,13 +1204,14 @@ export default function XApp() {
                   </button>
                 ))}
               </div>
+              <p className="text-[11px] text-gray-400 mt-1.5">{"Interest updated every 7 days"}</p>
             </div>
 
             <div>
               <div className="flex items-center justify-between mb-2">
-                <p className="text-xs text-gray-500 uppercase tracking-wider">Monto</p>
+                <p className="text-xs text-gray-500 uppercase tracking-wider">{"Amount"}</p>
                 <span className="text-xs text-gray-400">
-                  Disponible:{" "}
+                  {"Available:"}{" "}
                   <span className="font-semibold text-gray-700">
                     {walletBalance[asset].toFixed(4)} {asset}
                   </span>
@@ -1035,7 +1240,7 @@ export default function XApp() {
               </div>
               {!balanceLoading && walletBalance[asset] > 0 && Number(amount) > walletBalance[asset] + 1e-9 && (
                 <p className="text-xs text-red-500 mt-1">
-                  Supera el saldo disponible ({walletBalance[asset].toFixed(4)} {asset})
+                  {`Exceeds available balance (${walletBalance[asset].toFixed(4)} ${asset})`}
                 </p>
               )}
               <div className="flex gap-2 mt-2">
@@ -1053,7 +1258,7 @@ export default function XApp() {
 
             {Number(amount) > 0 && (
               <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-4 flex justify-between items-center">
-                <span className="text-sm text-gray-500">Retorno estimado</span>
+                <span className="text-sm text-gray-500">{"Estimated return"}</span>
                 <span className="text-sm font-semibold text-emerald-600">
                   +{estReturn} {asset}
                 </span>
@@ -1065,7 +1270,7 @@ export default function XApp() {
               disabled={loading || (!balanceLoading && walletBalance[asset] > 0 && Number(amount) > walletBalance[asset] + 1e-9)}
               className="w-full min-h-[52px] rounded-xl font-semibold text-base bg-gradient-to-r from-blue-500 to-violet-600 text-white active:opacity-80 disabled:opacity-40"
             >
-              {loading ? "Procesando…" : `Depositar ${amount || "0"} ${asset}`}
+              {loading ? "Processing…" : `Deposit ${amount || "0"} ${asset}`}
             </button>
           </div>
         )}
@@ -1075,11 +1280,12 @@ export default function XApp() {
           <div className="space-y-3">
             {activePositions.length === 0 ? (
               <div className="rounded-2xl bg-white border border-gray-200 shadow-sm p-10 text-center text-gray-500 text-sm">
-                Sin posiciones activas
+                {"No active positions"}
               </div>
             ) : (
               activePositions.map((pos) => {
-                const interest = calcInterest(pos.amount, pos.apy, pos.startDate)
+                const frozenInterest = getFrozenInterest(pos)
+                const daysToUpdate = getDaysUntilUpdate(pos.id)
                 const total = maxWithdrawable(pos)
                 const unlocked = canWithdraw(pos)
                 const days = daysLeft(pos.endDate)
@@ -1101,32 +1307,35 @@ export default function XApp() {
                         </span>
                       </div>
                       <span className="text-xs text-emerald-600 font-semibold">
-                        {pos.apy}% APY
+                        {getApyLabel(pos.asset, pos.lockMonths)}
                       </span>
                     </div>
                     <div className="grid grid-cols-3 gap-2">
                       <div>
-                        <p className="text-xs text-gray-500">Interés</p>
+                        <p className="text-xs text-gray-500">{"Interest"}</p>
                         <p className="text-sm text-emerald-600 font-medium">
-                          +{interest.toFixed(6)}
+                          +{frozenInterest.toFixed(6)}
                         </p>
+                        {daysToUpdate > 0 && (
+                          <p className="text-[10px] text-gray-400 mt-0.5">{"Updates in"} {daysToUpdate}d</p>
+                        )}
                       </div>
                       <div>
-                        <p className="text-xs text-gray-500">Inicio</p>
+                        <p className="text-xs text-gray-500">{"Start"}</p>
                         <p className="text-sm text-gray-700">
                           {new Date(pos.startDate).toLocaleDateString()}
                         </p>
                       </div>
                       <div>
                         <p className="text-xs text-gray-500">
-                          {pos.lockMonths === 0 ? "Estado" : "Desbloqueo"}
+                          {pos.lockMonths === 0 ? "Status" : "Unlock date"}
                         </p>
                         <p className={`text-sm ${unlocked ? "text-emerald-600" : "text-amber-600"}`}>
                           {pos.lockMonths === 0
                             ? "Flexible"
                             : unlocked
-                            ? "Libre ✓"
-                            : `${days} días`}
+                            ? "Unlocked ✓"
+                            : `${days} ${"days"}`}
                         </p>
                       </div>
                     </div>
@@ -1141,7 +1350,7 @@ export default function XApp() {
                       </button>
                     )}
                     {pending && (
-                      <p className="text-xs text-amber-600">Retiro pendiente — 24-48h</p>
+                      <p className="text-xs text-amber-600">{"Withdrawal pending — 24-48h"}</p>
                     )}
                     {realFunds && (
                       <button
@@ -1153,10 +1362,10 @@ export default function XApp() {
                             : "border border-gray-200 text-gray-400"}`}
                       >
                         {!unlocked
-                          ? `Bloqueado — ${days} días`
+                          ? `Locked — ${days} days`
                           : pending
-                          ? "Retiro pendiente"
-                          : `Retirar ${total.toFixed(4)} ${pos.asset}`}
+                          ? "Withdrawal pending"
+                          : `Withdraw ${total.toFixed(4)} ${pos.asset}`}
                       </button>
                     )}
                   </div>
@@ -1171,13 +1380,13 @@ export default function XApp() {
           <div className="space-y-4">
             {availableAssets.length === 0 ? (
               <div className="rounded-2xl bg-white border border-gray-200 shadow-sm p-10 text-center text-gray-500 text-sm">
-                Sin posiciones con fondos para retirar
+                {"No positions with funds to withdraw"}
               </div>
             ) : (
               <>
                 <div className="rounded-2xl bg-white border border-gray-200 shadow-sm p-5 space-y-5">
                   <div>
-                    <p className="text-xs text-gray-500 uppercase tracking-wider mb-2">Activo</p>
+                    <p className="text-xs text-gray-500 uppercase tracking-wider mb-2">{"Asset"}</p>
                     <div className="flex gap-3">
                       {availableAssets.map((a) => (
                         <button
@@ -1213,14 +1422,14 @@ export default function XApp() {
                   </div>
 
                   <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-4 flex justify-between items-center">
-                    <span className="text-sm text-gray-500">Disponible</span>
+                    <span className="text-sm text-gray-500">{"Available:"}</span>
                     <span className="text-sm font-semibold text-emerald-600">
                       {withdrawAvailableBalance.toFixed(4)} {withdrawAsset}
                     </span>
                   </div>
 
                   <div>
-                    <p className="text-xs text-gray-500 uppercase tracking-wider mb-2">Monto</p>
+                    <p className="text-xs text-gray-500 uppercase tracking-wider mb-2">{"Amount"}</p>
                     <div className="relative">
                       <input
                         type="number"
@@ -1256,16 +1465,16 @@ export default function XApp() {
                     className="w-full min-h-[52px] rounded-xl font-semibold text-base bg-gradient-to-r from-blue-500 to-violet-600 text-white active:opacity-80 disabled:opacity-40"
                   >
                     {withdrawPendingForAsset
-                      ? "Retiro pendiente para este activo"
+                      ? "Withdrawal pending for this asset"
                       : loading
-                      ? "Procesando…"
-                      : "Solicitar retiro"}
+                      ? "Processing…"
+                      : "Request withdrawal"}
                   </button>
                 </div>
 
                 {withdrawalRequests.filter((r) => r.status !== "cancelled").length > 0 && (
                   <div className="rounded-2xl bg-white border border-gray-200 shadow-sm p-5 space-y-3">
-                    <h3 className="text-sm font-semibold text-gray-900">Solicitudes de retiro</h3>
+                    <h3 className="text-sm font-semibold text-gray-900">{"Withdrawal requests"}</h3>
                     {withdrawalRequests.filter((r) => r.status !== "cancelled").map((req) => (
                       <div
                         key={req.id}
@@ -1285,14 +1494,14 @@ export default function XApp() {
                                 : "bg-amber-500/10 border-amber-500/30 text-amber-600"
                             }`}
                           >
-                            {req.status === "confirmed" ? "Completado ✓" : "Pendiente ⏳"}
+                            {req.status === "confirmed" ? "Completed ✓" : "Pending ⏳"}
                           </span>
                           {req.status === "pending" && (
                             <button
                               onClick={() => cancelWithdrawal(req.id)}
                               className="text-xs text-red-500 underline active:opacity-70 min-h-[32px] px-1"
                             >
-                              Cancelar
+                              {"Cancel"}
                             </button>
                           )}
                         </div>
@@ -1310,32 +1519,29 @@ export default function XApp() {
           <div className="space-y-4">
             <div className="rounded-2xl border border-gray-200 bg-white shadow-sm p-5 space-y-5">
               <div>
-                <h3 className="text-base font-semibold text-gray-900">Préstamo RLUSD</h3>
-                <p className="text-sm text-gray-500 mt-1">
-                  Deposita RLUSD como colateral y recibe el 75% como préstamo. 8% interés anual
-                  calculado diariamente. Mínimo 30 días antes de pagar.
-                </p>
+                <h3 className="text-base font-semibold text-gray-900">{"RLUSD Loan"}</h3>
+                <p className="text-sm text-gray-500 mt-1">Deposit RLUSD as collateral and receive 75% as a loan. 8% annual interest calculated daily. Minimum 30 days before repayment.</p>
               </div>
 
               <div className="rounded-xl bg-gray-50 border border-gray-200 p-4 space-y-3">
                 <p className="text-xs font-semibold text-gray-500 uppercase tracking-wider">
-                  Calculadora
+                  {"Calculator"}
                 </p>
                 <div className="grid grid-cols-2 gap-3">
                   <div>
-                    <p className="text-xs text-gray-400">Depositas (colateral)</p>
+                    <p className="text-xs text-gray-400">{"You deposit (collateral)"}</p>
                     <p className="text-base font-bold text-gray-900">
                       {loanCollateral || "0"} RLUSD
                     </p>
                   </div>
                   <div>
-                    <p className="text-xs text-gray-400">Recibes (75% LTV)</p>
+                    <p className="text-xs text-gray-400">{"You receive (75% LTV)"}</p>
                     <p className="text-base font-bold text-violet-600">
                       {loanCollateral ? (Number(loanCollateral) * 0.75).toFixed(2) : "0"} RLUSD
                     </p>
                   </div>
                   <div>
-                    <p className="text-xs text-gray-400">Interés diario</p>
+                    <p className="text-xs text-gray-400">{"Daily interest"}</p>
                     <p className="text-sm font-semibold text-amber-600">
                       {loanCollateral
                         ? (((Number(loanCollateral) * 0.75) * 8) / 100 / 365).toFixed(6)
@@ -1344,7 +1550,7 @@ export default function XApp() {
                     </p>
                   </div>
                   <div>
-                    <p className="text-xs text-gray-400">Interés anual (8%)</p>
+                    <p className="text-xs text-gray-400">{"Annual interest (8%)"}</p>
                     <p className="text-sm font-semibold text-amber-600">
                       {loanCollateral
                         ? ((Number(loanCollateral) * 0.75) * 0.08).toFixed(4)
@@ -1358,10 +1564,10 @@ export default function XApp() {
               <div>
                 <div className="flex items-center justify-between mb-2">
                   <p className="text-xs text-gray-500 uppercase tracking-wider">
-                    Monto de colateral (RLUSD)
+                    Collateral amount (RLUSD)
                   </p>
                   <span className="text-xs text-gray-400">
-                    Depositado en vault:{" "}
+                    {"Deposited in vault:"}{" "}
                     <span className="font-semibold text-gray-700">
                       {rlusdVaultBalance.toFixed(4)} RLUSD
                     </span>
@@ -1390,7 +1596,7 @@ export default function XApp() {
                 </div>
                 {Number(loanCollateral) > rlusdVaultBalance + 1e-9 && rlusdVaultBalance > 0 && (
                   <p className="text-xs text-red-500 mt-1">
-                    Supera el RLUSD depositado en vault ({rlusdVaultBalance.toFixed(4)})
+                    {`Exceeds RLUSD deposited in vault (rlusdVaultBalance.toFixed(4))`}
                   </p>
                 )}
                 <div className="flex gap-2 mt-2">
@@ -1408,14 +1614,14 @@ export default function XApp() {
 
               <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 space-y-1.5">
                 <p className="text-xs font-semibold text-amber-700 uppercase tracking-wider">
-                  Términos del préstamo
+                  {"Loan terms"}
                 </p>
                 <div className="space-y-1 text-sm text-amber-700">
-                  <p>✓ LTV: 75% — deposita 100 RLUSD, recibe 75 RLUSD</p>
-                  <p>✓ Interés: 8% APY calculado diariamente</p>
-                  <p>✓ Período mínimo: 30 días antes del pago</p>
-                  <p>✓ Colateral retenido hasta pago completo</p>
-                  <p>✓ Default: colateral retenido si no se paga</p>
+                  <p>{"✓ LTV: 75% — deposit 100 RLUSD, receive 75 RLUSD"}</p>
+                  <p>{"✓ Interest: 8% APY calculated daily"}</p>
+                  <p>{"✓ Minimum period: 30 days before repayment"}</p>
+                  <p>{"✓ Collateral held until full repayment"}</p>
+                  <p>{"✓ Default: collateral retained if not repaid"}</p>
                 </div>
               </div>
 
@@ -1426,8 +1632,7 @@ export default function XApp() {
                   className="mt-0.5 w-4 h-4 accent-violet-600 shrink-0"
                 />
                 <span className="text-sm text-gray-600">
-                  Acepto los términos: 75% LTV · 8% APY · 30 días mínimo · colateral retenido en
-                  caso de default.{" "}
+                  I accept the terms: 75% LTV · 8% APY · 30 day minimum · collateral retained in case of default.{" "}
                   <button
                     type="button"
                     onClick={() =>
@@ -1437,7 +1642,7 @@ export default function XApp() {
                     }
                     className="text-violet-600 underline"
                   >
-                    Ver términos
+                    {"View terms"}
                   </button>
                 </span>
               </label>
@@ -1447,14 +1652,14 @@ export default function XApp() {
                 disabled={loading || !loanCollateral || Number(loanCollateral) <= 0}
                 className="w-full min-h-[52px] rounded-xl font-semibold text-base bg-gradient-to-r from-blue-500 to-violet-600 text-white active:opacity-80 disabled:opacity-40"
               >
-                {`Solicitar préstamo — depositar ${loanCollateral || "0"} RLUSD colateral`}
+                {`Request loan — deposit ${loanCollateral || "0"} RLUSD collateral`}
               </button>
             </div>
 
             {loans.filter((l) => l.status === "active").length > 0 && (
               <div className="space-y-3">
                 <p className="text-xs font-semibold text-gray-500 uppercase tracking-wider">
-                  Préstamos activos
+                  {"Active loans"}
                 </p>
                 {loans
                   .filter((l) => l.status === "active")
@@ -1468,24 +1673,24 @@ export default function XApp() {
                           {loan.loanAmount.toFixed(2)} RLUSD
                         </span>
                         <span className="text-xs px-2 py-0.5 rounded-full bg-amber-100 text-amber-700 border border-amber-200">
-                          {loan.daysActive} días activo
+                          {loan.daysActive} days active
                         </span>
                       </div>
                       <div className="grid grid-cols-3 gap-2">
                         <div>
-                          <p className="text-xs text-gray-400">Colateral</p>
+                          <p className="text-xs text-gray-400">{"Collateral"}</p>
                           <p className="text-sm font-semibold text-gray-900">
                             {loan.collateral} RLUSD
                           </p>
                         </div>
                         <div>
-                          <p className="text-xs text-gray-400">Interés</p>
+                          <p className="text-xs text-gray-400">{"Interest"}</p>
                           <p className="text-sm font-semibold text-amber-600">
                             +{loan.interestAccrued.toFixed(6)}
                           </p>
                         </div>
                         <div>
-                          <p className="text-xs text-gray-400">Total a pagar</p>
+                          <p className="text-xs text-gray-400">{"Total due"}</p>
                           <p className="text-sm font-semibold text-gray-900">
                             {loan.totalDue.toFixed(4)}
                           </p>
@@ -1500,8 +1705,8 @@ export default function XApp() {
                             : "border border-gray-200 text-gray-400"}`}
                       >
                         {loan.canRepay
-                          ? `Pagar ${loan.totalDue.toFixed(4)} RLUSD → recuperar ${loan.collateral} RLUSD`
-                          : `Disponible en ${30 - loan.daysActive} días`}
+                          ? `Pay ${loan.totalDue.toFixed(4)} RLUSD → recover ${loan.collateral} RLUSD`
+                          : `Available in ${30 - loan.daysActive} days`}
                       </button>
                     </div>
                   ))}
@@ -1514,9 +1719,9 @@ export default function XApp() {
         {tab === "history" && (
           <div className="space-y-4">
             <div className="rounded-2xl bg-white border border-gray-200 shadow-sm p-5 space-y-3">
-              <h3 className="text-sm font-semibold text-gray-900">Depósitos</h3>
+              <h3 className="text-sm font-semibold text-gray-900">{"Deposits"}</h3>
               {deposits.length === 0 ? (
-                <p className="text-center text-gray-500 py-4 text-sm">Sin depósitos aún</p>
+                <p className="text-center text-gray-500 py-4 text-sm">{"No deposits yet"}</p>
               ) : (
                 deposits.map((tx) => {
                   const txStatus = tx.status ?? (tx.txid ? "confirmed" : "pending")
@@ -1542,7 +1747,7 @@ export default function XApp() {
                               : "bg-amber-50 border-amber-200 text-amber-700"
                           }`}
                         >
-                          {txStatus === "confirmed" ? "Confirmado" : "Pendiente"}
+                          {txStatus === "confirmed" ? "Confirmed" : "Pending"}
                         </span>
                         {tx.txid && (
                           <button
@@ -1562,9 +1767,9 @@ export default function XApp() {
             </div>
 
             <div className="rounded-2xl bg-white border border-gray-200 shadow-sm p-5 space-y-3">
-              <h3 className="text-sm font-semibold text-gray-900">Retiros</h3>
+              <h3 className="text-sm font-semibold text-gray-900">{"Withdrawals"}</h3>
               {withdrawals.length === 0 ? (
-                <p className="text-center text-gray-500 py-4 text-sm">Sin retiros aún</p>
+                <p className="text-center text-gray-500 py-4 text-sm">{"No withdrawals yet"}</p>
               ) : (
                 withdrawals.map((tx) => {
                   const txStatus = tx.status ?? (tx.txid ? "confirmed" : "pending")
@@ -1590,7 +1795,7 @@ export default function XApp() {
                               : "bg-amber-50 border-amber-200 text-amber-700"
                           }`}
                         >
-                          {txStatus === "confirmed" ? "Completado" : "Pendiente"}
+                          {txStatus === "confirmed" ? "Completed" : "Pending"}
                         </span>
                         {tx.txid && (
                           <button
@@ -1616,11 +1821,11 @@ export default function XApp() {
       <footer className="px-4 pt-6 pb-8 text-center">
         <p className="text-xs text-gray-400 leading-relaxed">
           © 2026 AX Vault ·{" "}
-          <button onClick={() => openBrowser("https://asvexo.com/terms")} className="underline active:opacity-70">Términos</button>
+          <button onClick={() => openBrowser("https://asvexo.com/terms")} className="underline active:opacity-70">{"Terms"}</button>
           {" · "}
-          <button onClick={() => openBrowser("https://asvexo.com/privacy")} className="underline active:opacity-70">Privacidad</button>
+          <button onClick={() => openBrowser("https://asvexo.com/privacy")} className="underline active:opacity-70">{"Privacy"}</button>
           {" · "}
-          <button onClick={() => openBrowser("https://asvexo.com/contact")} className="underline active:opacity-70">Contacto</button>
+          <button onClick={() => openBrowser("https://asvexo.com/contact")} className="underline active:opacity-70">{"Contact"}</button>
         </p>
       </footer>
 
@@ -1630,14 +1835,14 @@ export default function XApp() {
           <div className="w-full max-w-sm rounded-2xl border border-gray-200 bg-white p-6 text-center space-y-4 shadow-2xl">
             <h3 className="text-base font-semibold bg-clip-text text-transparent bg-gradient-to-r from-purple-600 to-violet-500">
               {connectUuid
-                ? "Conectar wallet Xaman"
+                ? "Connect Xaman wallet"
                 : withdrawUuid
-                ? `Retirar ${withdrawModal?.amount.toFixed(4)} ${withdrawModal?.asset}`
-                : `Depositar ${asset}`}
+                ? `Withdraw ${(withdrawModal?.amount ?? 0).toFixed(4)} ${withdrawModal?.asset ?? ""}`
+                : `Deposit ${amount || "0"} ${asset}`}
             </h3>
             {countdown !== null && (
               <p className="text-xs text-gray-500">
-                Expira en{" "}
+                {"Expires in"}{" "}
                 <span
                   className={`font-mono font-semibold ${
                     countdown < 60 ? "text-red-600" : "text-gray-700"
@@ -1649,23 +1854,21 @@ export default function XApp() {
             )}
             <img src={qr} alt="Xaman QR" className="mx-auto w-48 h-48 rounded-xl" />
             <p className="text-sm text-gray-500">
-              {withdrawUuid
-                ? "Admin: escanea para firmar el pago"
-                : "Escanea con tu app Xaman"}
+              {"Scan with your Xaman app"}
             </p>
             {deeplink && (
               <a
                 href={deeplink}
                 className="flex items-center justify-center w-full min-h-[52px] rounded-xl text-sm font-semibold bg-gradient-to-r from-blue-500 to-violet-600 text-white active:opacity-80"
               >
-                Abrir en Xaman
+                {"Open in Xaman"}
               </a>
             )}
             <button
               onClick={closeModal}
               className="w-full min-h-[44px] text-sm text-gray-500 active:text-gray-900"
             >
-              Cancelar
+              {"Cancel"}
             </button>
           </div>
         </div>
