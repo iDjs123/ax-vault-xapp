@@ -169,7 +169,7 @@ function canWithdrawPosition(position: Position, requests: WithdrawalRequest[]):
 
 type Tab = "deposit" | "positions" | "withdraw" | "loans" | "history"
 
-const API_KEY = "588cd466-956f-4a68-a451-456cd1cfa646"
+const API_KEY = process.env.NEXT_PUBLIC_XUMM_API_KEY!
 
 export default function XApp() {
   const xummRef = useRef<any>(null)
